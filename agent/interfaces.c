@@ -282,6 +282,14 @@ nice_interfaces_get_local_ips (gboolean include_loopback)
           ifa->ifa_name, IGNORED_IFACE_PREFIX);
       g_free (addr_string);
 #endif
+    } else if (g_str_has_prefix (ifa->ifa_name, "docker") ||
+               g_str_has_prefix (ifa->ifa_name, "veth") ||
+               g_str_has_prefix (ifa->ifa_name, "vmnic") ||
+               g_str_has_prefix (ifa->ifa_name, "vnic") ||
+               g_str_has_prefix (ifa->ifa_name, "vboxnext") ||
+               g_str_has_prefix (ifa->ifa_name, "virbr")) {
+      nice_debug ("Ignoring interface %s", ifa->ifa_name);
+      g_free (addr_string);
     } else {
       if (nice_interfaces_is_private_ip (ifa->ifa_addr))
         ips = add_ip_to_list (ips, addr_string, TRUE);
