@@ -405,6 +405,13 @@ nice_agent_class_init (NiceAgentClass *klass)
 	1, /* not a construct property, ignored */
         G_PARAM_READWRITE));
 
+  /**
+   * NiceAgent:controlling-mode:
+   *
+   * Whether the agent has the controlling role. This property should
+   * be modified before gathering candidates, any modification occuring
+   * later will be hold until ICE is restarted.
+   */
   g_object_class_install_property (gobject_class, PROP_CONTROLLING_MODE,
       g_param_spec_boolean (
         "controlling-mode",
@@ -1107,6 +1114,47 @@ static void priv_generate_tie_breaker (NiceAgent *agent)
 }
 
 static void
+priv_update_controlling_mode (NiceAgent *agent, gboolean value)
+{
+  gboolean update_controlling_mode;
+  GSList *i, *j;
+
+  agent->saved_controlling_mode = value;
+  /* It is safe to update the agent controlling mode when all
+   * components are still in state disconnected. When we leave
+   * this state, the role must stay under the control of the
+   * conncheck algorithm exclusively, until the conncheck is
+   * eventually restarted. See RFC5245, sect 5.2. Determining Role
+   */
+  if (agent->controlling_mode != agent->saved_controlling_mode) {
+    update_controlling_mode = TRUE;
+    for (i = agent->streams;
+         i && update_controlling_mode; i = i->next) {
+      NiceStream *stream = i->data;
+      for (j = stream->components;
+           j && update_controlling_mode; j = j->next) {
+        NiceComponent *component = j->data;
+        if (component->state > NICE_COMPONENT_STATE_DISCONNECTED)
+          update_controlling_mode = FALSE;
+      }
+    }
+    if (update_controlling_mode) {
+      agent->controlling_mode = agent->saved_controlling_mode;
+      nice_debug ("Agent %p : Property set, changing role to \"%s\".",
+        agent, agent->controlling_mode ? "controlling" : "controlled");
+    } else {
+      nice_debug ("Agent %p : Property set, role switch requested "
+        "but conncheck already started.", agent);
+      nice_debug ("Agent %p : Property set, staying with role \"%s\" "
+        "until restart.", agent,
+        agent->controlling_mode ? "controlling" : "controlled");
+    }
+  } else
+    nice_debug ("Agent %p : Property set, role is already \"%s\".", agent,
+      agent->controlling_mode ? "controlling" : "controlled");
+}
+
+static void
 nice_agent_init (NiceAgent *agent)
 {
   agent->next_candidate_id = 1;
@@ -1115,6 +1163,7 @@ nice_agent_init (NiceAgent *agent)
   /* set defaults; not construct params, so set here */
   agent->stun_server_port = DEFAULT_STUN_PORT;
   agent->controlling_mode = TRUE;
+  agent->saved_controlling_mode = TRUE;
   agent->max_conn_checks = NICE_AGENT_MAX_CONNECTIVITY_CHECKS_DEFAULT;
   agent->nomination_mode = NICE_NOMINATION_MODE_AGGRESSIVE;
 
@@ -1213,7 +1262,7 @@ nice_agent_get_property (
       break;
 
     case PROP_CONTROLLING_MODE:
-      g_value_set_boolean (value, agent->controlling_mode);
+      g_value_set_boolean (value, agent->saved_controlling_mode);
       break;
 
     case PROP_FULL_MODE:
@@ -1422,7 +1471,7 @@ nice_agent_set_property (
       break;
 
     case PROP_CONTROLLING_MODE:
-      agent->controlling_mode = g_value_get_boolean (value);
+      priv_update_controlling_mode (agent, g_value_get_boolean (value));
       break;
 
     case PROP_FULL_MODE:
@@ -2498,9 +2547,8 @@ priv_add_new_candidate_discovery_turn (NiceAgent *agent,
     if (nicesock == NULL)
       return;
 
-    if (agent->reliable)
-      nice_socket_set_writable_callback (nicesock, _tcp_sock_is_writable,
-          component);
+    nice_socket_set_writable_callback (nicesock, _tcp_sock_is_writable, component);
+
     if (turn->type ==  NICE_RELAY_TYPE_TURN_TLS &&
         agent->compatibility == NICE_COMPATIBILITY_GOOGLE) {
       nicesock = nice_pseudossl_socket_new (nicesock,
@@ -2984,10 +3032,8 @@ nice_agent_gather_candidates (
         found_local_address = TRUE;
         nice_address_set_port (addr, 0);
 
-
-        if (agent->reliable)
-          nice_socket_set_writable_callback (host_candidate->sockptr,
-              _tcp_sock_is_writable, component);
+        nice_socket_set_writable_callback (host_candidate->sockptr,
+            _tcp_sock_is_writable, component);
 
 #ifdef HAVE_GUPNP
       if (agent->upnp_enabled && agent->upnp &&
@@ -3013,11 +3059,13 @@ nice_agent_gather_candidates (
           if (nice_address_set_from_string (&stun_server, agent->stun_server_ip)) {
             nice_address_set_port (&stun_server, agent->stun_server_port);
 
-            priv_add_new_candidate_discovery_stun (agent,
-                host_candidate->sockptr,
-                stun_server,
-                stream,
-                cid);
+            if (nice_address_ip_version (&host_candidate->addr) ==
+                nice_address_ip_version (&stun_server))
+              priv_add_new_candidate_discovery_stun (agent,
+                  host_candidate->sockptr,
+                  stun_server,
+                  stream,
+                  cid);
           }
         }
 
@@ -3251,6 +3299,28 @@ nice_agent_add_local_address (NiceAgent *agent, NiceAddress *addr)
   return TRUE;
 }
 
+/* Recompute foundations of all candidate pairs from a given stream
+ * having a specific remote candidate
+ */
+static void priv_update_pair_foundations (NiceAgent *agent,
+    guint stream_id, NiceCandidate *remote)
+{
+  NiceStream *stream = agent_find_stream (agent, stream_id);
+  if (stream) {
+    GSList *i;
+    for (i = stream->conncheck_list; i; i = i->next) {
+      CandidateCheckPair *pair = i->data;
+      if (pair->remote == remote) {
+        g_snprintf (pair->foundation,
+            NICE_CANDIDATE_PAIR_MAX_FOUNDATION, "%s:%s",
+            pair->local->foundation, pair->remote->foundation);
+        nice_debug ("Agent %p : Updating pair %p foundation to '%s'",
+            agent, pair, pair->foundation);
+      }
+    }
+  }
+}
+
 static gboolean priv_add_remote_candidate (
   NiceAgent *agent,
   guint stream_id,
@@ -3282,8 +3352,7 @@ static gboolean priv_add_remote_candidate (
 
   /* If it was a discovered remote peer reflexive candidate, then it should
    * be updated according to RFC 5245 section 7.2.1.3 */
-  if (candidate && candidate->type == NICE_CANDIDATE_TYPE_PEER_REFLEXIVE &&
-      candidate->priority == priority) {
+  if (candidate && candidate->type == NICE_CANDIDATE_TYPE_PEER_REFLEXIVE) {
     nice_debug ("Agent %p : Updating existing peer-rfx remote candidate to %s",
         agent, _cand_type_to_sdp (type));
     candidate->type = type;
@@ -3316,16 +3385,30 @@ static gboolean priv_add_remote_candidate (
      * this is essential to overcome a race condition where we might receive
      * a valid binding request from a valid candidate that wasn't yet added to
      * our list of candidates.. this 'update' will make the peer-rflx a
-     * server-rflx/host candidate again and restore that user/pass it needed
-     * to have in the first place */
+     * server-rflx/host candidate again */
     if (username) {
-      g_free (candidate->username);
-      candidate->username = g_strdup (username);
+      if (candidate->username == NULL)
+        candidate->username = g_strdup (username);
+      else if (g_strcmp0 (username, candidate->username))
+        nice_debug ("Agent %p : Candidate username '%s' is not allowed "
+            "to change to '%s' now (ICE restart only).", agent,
+            candidate->username, username);
     }
     if (password) {
-      g_free (candidate->password);
-      candidate->password = g_strdup (password);
+      if (candidate->password == NULL)
+        candidate->password = g_strdup (password);
+      else if (g_strcmp0 (password, candidate->password))
+        nice_debug ("Agent %p : candidate password '%s' is not allowed "
+            "to change to '%s' now (ICE restart only).", agent,
+            candidate->password, password);
     }
+
+    /* since the type of the existing candidate may have changed,
+     * the pairs priority and foundation related to this candidate need
+     * to be recomputed.
+     */
+    recalculate_pair_priorities (agent);
+    priv_update_pair_foundations (agent, stream_id, candidate);
   }
   else {
     /* case 2: add a new candidate */
@@ -3380,12 +3463,14 @@ static gboolean priv_add_remote_candidate (
     if (foundation)
       g_strlcpy (candidate->foundation, foundation,
           NICE_CANDIDATE_MAX_FOUNDATION);
-  }
 
-  if (conn_check_add_for_candidate (agent, stream_id, component, candidate) < 0) {
-    goto errors;
+    /* We only create a pair when a candidate is new, and not when
+     * updating an existing one.
+     */
+    if (conn_check_add_for_candidate (agent, stream_id,
+        component, candidate) < 0)
+      goto errors;
   }
-
   return TRUE;
 
 errors:
@@ -4280,7 +4365,7 @@ nice_agent_recv_cancelled_cb (GCancellable *cancellable, gpointer user_data)
 {
   GError **error = user_data;
 
-  if (error && *error)
+  if (error && !*error)
     g_cancellable_set_error_if_cancelled (cancellable, error);
   return G_SOURCE_REMOVE;
 }
@@ -4929,6 +5014,11 @@ nice_agent_restart (
 
   /* step: regenerate tie-breaker value */
   priv_generate_tie_breaker (agent);
+
+  /* step: reset controlling mode from the property value */
+  agent->controlling_mode = agent->saved_controlling_mode;
+  nice_debug ("Agent %p : ICE restart, reset role to \"%s\".",
+      agent, agent->controlling_mode ? "controlling" : "controlled");
 
   for (i = agent->streams; i; i = i->next) {
     NiceStream *stream = i->data;
