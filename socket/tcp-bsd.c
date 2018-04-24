@@ -290,6 +290,12 @@ socket_send_message (NiceSocket *sock,
   GError *gerr = NULL;
   gsize message_len;
 
+  if (sock == NULL)
+    return -1;
+
+  if (sock->priv == NULL || sock->fileno == NULL) {
+    return -1;
+  }
   /* Make sure socket has not been freed: */
   g_assert (sock->priv != NULL);
 
